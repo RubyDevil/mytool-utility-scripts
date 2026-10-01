@@ -1,12 +1,35 @@
 #!/bin/bash
 
+if [[ $# -eq 1 && ("$1" == -h || "$1" == --help) ]]; then
+    cat <<'HELP'
+Show a one-screen hardware health snapshot through IPMI: temperatures, fans,
+power supplies, and the latest system event log entries.
+
+Usage:
+  ipmi-status [EVENTS]
+
+  EVENTS   How many recent log entries to show, 1-100 (default 5)
+
+Examples:
+  ipmi-status
+  ipmi-status 20
+
+Sensors are marked ok, FAIL, or n/a (no reading, such as an empty slot).
+Exit status: 0 when every sensor is OK, 1 when a sensor needs attention,
+2 when the sensors cannot be read or the arguments are wrong.
+
+Members of the sudo, admin, or wheel group can run it without typing sudo.
+HELP
+    exit 0
+fi
+
 if [[ $# -eq 0 ]]; then
     events=5
 elif [[ $# -eq 1 && "$1" =~ ^[0-9]{1,3}$ ]] && ((10#$1 >= 1 && 10#$1 <= 100)); then
     # Force base 10 so values such as 08 are not read as octal.
     events=$((10#$1))
 else
-    echo "Usage: ipmi-status [1-100]"
+    echo "Usage: ipmi-status [1-100]  (see ipmi-status --help)" >&2
     exit 2
 fi
 

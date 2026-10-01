@@ -1,12 +1,32 @@
 #!/bin/bash
 
+if [[ $# -eq 1 && ("$1" == -h || "$1" == --help) ]]; then
+    cat <<'HELP'
+Set the speed of every server fan through IPMI (Dell iDRAC).
+
+Usage:
+  fan-speed <0-100|auto>
+
+  0-100   Run every fan at that percentage, whatever the temperature
+  auto    Hand fan control back to the iDRAC
+
+Examples:
+  fan-speed 30
+  fan-speed 100
+  fan-speed auto
+
+Members of the sudo, admin, or wheel group can run it without typing sudo.
+HELP
+    exit 0
+fi
+
 if [[ $# -eq 1 && "$1" == auto ]]; then
     mode=auto
 elif [[ $# -eq 1 && "$1" =~ ^[0-9]{1,3}$ ]] && ((10#$1 <= 100)); then
     # Force base 10 so values such as 08 are not read as octal.
     mode=$((10#$1))
 else
-    echo "Usage: fan-speed <0-100|auto>"
+    echo "Usage: fan-speed <0-100|auto>  (see fan-speed --help)" >&2
     exit 1
 fi
 

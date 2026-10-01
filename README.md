@@ -30,3 +30,4 @@ install, uninstall, and update them.
 - Updating a script runs the installed version's `uninstall.sh`, then the new version's `install.sh`.
 - Without `documentation.md`, mytool shows the output of `<name> --help`, so scripts without a
   documentation file must handle `--help` without side effects.
+- Every script here also prints a short usage with `--help`, for use on the server itself.

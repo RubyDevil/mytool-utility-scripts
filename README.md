@@ -8,7 +8,10 @@ install, uninstall, and update them.
 
 | Script | Description |
 | --- | --- |
-| [fan-speed](fan-speed/documentation.md) | Set the speed of every server fan through IPMI (Dell iDRAC). |
+| [fan-speed](fan-speed/documentation.md) | Set the speed of every server fan through IPMI (Dell iDRAC), or return it to automatic. |
+| [ipmi-status](ipmi-status/documentation.md) | Show a hardware health snapshot through IPMI: temperatures, fans, power supplies, and recent events. |
+| [ports](ports/documentation.md) | Show each listening port with its address, process, and systemd service. |
+| [sysinfo](sysinfo/documentation.md) | Show a login summary: uptime, load, memory, disks, failed services, updates, and reboot status. |
 
 ## Layout
 

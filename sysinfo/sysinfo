@@ -1,0 +1,206 @@
+#!/bin/bash
+# Each section checks for the tools it needs and is skipped when they are missing.
+
+if [[ $# -ne 0 ]]; then
+    echo "Usage: sysinfo"
+    exit 1
+fi
+
+if [[ -t 1 && -z "${NO_COLOR-}" ]]; then
+    red=$'\e[31m' yellow=$'\e[33m' green=$'\e[32m' bold=$'\e[1m' reset=$'\e[0m'
+else
+    red='' yellow='' green='' bold='' reset=''
+fi
+
+row() {
+    printf '%s%-9s%s %s\n' "$bold" "$1" "$reset" "$2"
+}
+
+# Colour a value red at or above the critical percentage, yellow at or above the warning one.
+level() {
+    local percent="$1" warning="$2" critical="$3" text="$4"
+
+    if ((percent >= critical)); then
+        printf '%s%s%s' "$red" "$text" "$reset"
+    elif ((percent >= warning)); then
+        printf '%s%s%s' "$yellow" "$text" "$reset"
+    else
+        printf '%s' "$text"
+    fi
+}
+
+# Print a size given in KiB, such as 3.8 GiB.
+human() {
+    awk -v size="$1" 'BEGIN {
+        split("KiB MiB GiB TiB PiB", units)
+        for (unit = 1; size >= 1024 && unit < 5; unit++) size /= 1024
+        printf (size < 10 && unit > 1) ? "%.1f %s" : "%.0f %s", size, units[unit]
+    }'
+}
+
+# Print a size used out of a total, both in KiB, such as "1.2 GiB used of 3.8 GiB (31%)".
+usage() {
+    local used="$1" total="$2" warning="$3" critical="$4"
+    local percent=$((total > 0 ? used * 100 / total : 0))
+
+    level "$percent" "$warning" "$critical" "$(human "$used") used of $(human "$total") ($percent%)"
+}
+
+show_header() {
+    local name os='' virt=''
+
+    name=$(hostname 2>/dev/null || cat /proc/sys/kernel/hostname)
+    if [[ -r /etc/os-release ]]; then
+        os=$(sed -n 's/^PRETTY_NAME=//p' /etc/os-release | tr -d '"')
+    fi
+    if command -v systemd-detect-virt >/dev/null; then
+        virt=$(systemd-detect-virt 2>/dev/null)
+        [[ "$virt" == none ]] && virt="bare metal"
+    fi
+    printf '%s%s%s' "$bold" "$name" "$reset"
+    printf ' · %s' ${os:+"$os"} "kernel $(uname -r)" ${virt:+"$virt"}
+    printf '\n\n'
+}
+
+show_uptime() {
+    local seconds days hours minutes text
+
+    [[ -r /proc/uptime ]] || return
+    read -r seconds _ </proc/uptime
+    seconds=${seconds%.*}
+    days=$((seconds / 86400)) hours=$((seconds % 86400 / 3600)) minutes=$((seconds % 3600 / 60))
+    if ((days > 0)); then
+        text="$days day$( ((days == 1)) || echo s), $hours hour$( ((hours == 1)) || echo s)"
+    elif ((hours > 0)); then
+        text="$hours hour$( ((hours == 1)) || echo s), $minutes minute$( ((minutes == 1)) || echo s)"
+    else
+        text="$minutes minute$( ((minutes == 1)) || echo s)"
+    fi
+    row Uptime "$text (since $(date -d "@$(($(date +%s) - seconds))" '+%Y-%m-%d %H:%M'))"
+}
+
+show_load() {
+    local one five fifteen tasks cpus percent
+
+    [[ -r /proc/loadavg ]] || return
+    read -r one five fifteen tasks _ </proc/loadavg
+    cpus=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null) || return
+    # Load relative to the CPU count: 100% means every CPU is busy on average.
+    percent=$(awk -v load="$one" -v cpus="$cpus" 'BEGIN { printf "%d", load * 100 / cpus }')
+    row Load "$(level "$percent" 70 100 "$one $five $fifteen") on $cpus CPU$( ((cpus == 1)) || echo s), ${tasks#*/} processes"
+}
+
+show_memory() {
+    local key value memory_total memory_available swap_total swap_free
+
+    [[ -r /proc/meminfo ]] || return
+    while read -r key value _; do
+        case "$key" in
+            MemTotal:) memory_total=$value ;;
+            MemAvailable:) memory_available=$value ;;
+            SwapTotal:) swap_total=$value ;;
+            SwapFree:) swap_free=$value ;;
+        esac
+    done </proc/meminfo
+    if [[ -n "${memory_total-}" && -n "${memory_available-}" ]]; then
+        row Memory "$(usage $((memory_total - memory_available)) "$memory_total" 80 90)"
+    fi
+    if ((${swap_total:-0} > 0)); then
+        row Swap "$(usage $((swap_total - ${swap_free:-0})) "$swap_total" 50 80)"
+    elif [[ -n "${swap_total-}" ]]; then
+        row Swap none
+    fi
+}
+
+show_disks() {
+    local i device size used mount width=1 label=Disks
+    local -a devices=() sizes=() useds=() mounts=()
+    local -A seen=()
+
+    command -v df >/dev/null || return
+    # Local filesystems only, so a dead network mount cannot hang the summary.
+    while read -r device size used _ _ mount; do
+        # Bind mounts and btrfs subvolumes repeat the same device; show it once.
+        [[ -n "${seen[$device]-}" ]] && continue
+        seen[$device]=1
+        devices+=("$device") sizes+=("$size") useds+=("$used") mounts+=("$mount")
+        ((${#mount} > width)) && width=${#mount}
+    done < <(df -kPl -x tmpfs -x devtmpfs -x squashfs -x overlay -x efivarfs -x ramfs 2>/dev/null | tail -n +2)
+
+    for i in "${!devices[@]}"; do
+        row "$label" "$(printf '%-*s  ' "$width" "${mounts[i]}")$(usage "${useds[i]}" "${sizes[i]}" 80 90)"
+        label=''
+    done
+}
+
+show_services() {
+    local names
+    local -a failed=()
+
+    # Skip machines and containers that were not booted with systemd.
+    command -v systemctl >/dev/null && [[ -d /run/systemd/system ]] || return
+    mapfile -t failed < <(systemctl list-units --state=failed --no-legend --plain 2>/dev/null | awk '{ print $1 }')
+    if ((${#failed[@]} == 0)); then
+        row Services "${green}no failed units$reset"
+    else
+        names=$(printf ', %s' "${failed[@]}")
+        row Services "$red${#failed[@]} failed:$reset ${names:2}"
+    fi
+}
+
+show_updates() {
+    local counts pending security
+
+    command -v apt-get >/dev/null || return
+    # Ubuntu's apt-check counts security updates too; elsewhere, simulate an upgrade.
+    if [[ -x /usr/lib/update-notifier/apt-check ]] &&
+        counts=$(/usr/lib/update-notifier/apt-check 2>&1) && [[ "$counts" =~ ^([0-9]+)\;([0-9]+)$ ]]; then
+        pending=${BASH_REMATCH[1]} security=${BASH_REMATCH[2]}
+    else
+        counts=$(apt-get -s -o Debug::NoLocking=true dist-upgrade 2>/dev/null | grep '^Inst ')
+        pending=$(grep -c . <<<"$counts")
+        security=$(grep -ci security <<<"$counts")
+    fi
+    if ((pending == 0)); then
+        row Updates "${green}up to date$reset"
+    elif ((security > 0)); then
+        row Updates "$pending pending, ${yellow}$security security$reset"
+    else
+        row Updates "$pending pending"
+    fi
+}
+
+show_reboot() {
+    local running flavour newest packages
+
+    if [[ -f /var/run/reboot-required ]]; then
+        packages=''
+        if [[ -r /var/run/reboot-required.pkgs ]]; then
+            packages=$(sort -u /var/run/reboot-required.pkgs | paste -sd ' ')
+        fi
+        row Reboot "${yellow}required$reset${packages:+ by $packages}"
+        return
+    fi
+    # Without the flag file, compare the running kernel with the newest one installed.
+    # Kernels that are not in /boot, such as a VPS provider's, are left out.
+    running=$(uname -r)
+    if [[ -f "/boot/vmlinuz-$running" ]]; then
+        # Only compare kernels of the same flavour, such as "generic" in 6.8.0-45-generic.
+        flavour=${running#"${running%%[!0-9.-]*}"}
+        newest=$(printf '%s\n' /boot/vmlinuz-*"$flavour" | sed 's|^/boot/vmlinuz-||' | sort -V | tail -n 1)
+        if [[ "$newest" != "$running" ]]; then
+            row Reboot "${yellow}required$reset to run kernel $newest"
+            return
+        fi
+    fi
+    row Reboot "${green}not needed$reset"
+}
+
+show_header
+show_uptime
+show_load
+show_memory
+show_disks
+show_services
+show_updates
+show_reboot

@@ -1,0 +1,124 @@
+#!/bin/bash
+
+if [[ $# -eq 0 ]]; then
+    events=5
+elif [[ $# -eq 1 && "$1" =~ ^[0-9]{1,3}$ ]] && ((10#$1 >= 1 && 10#$1 <= 100)); then
+    # Force base 10 so values such as 08 are not read as octal.
+    events=$((10#$1))
+else
+    echo "Usage: ipmi-status [1-100]"
+    exit 2
+fi
+
+# Re-run as root; mytool installs a passwordless sudoers rule for this script.
+if ((EUID != 0)); then
+    exec sudo -- "$0" "$events"
+fi
+
+if ! command -v ipmitool >/dev/null; then
+    echo "ipmitool is not installed." >&2
+    exit 2
+fi
+
+if [[ -t 1 && -z "${NO_COLOR-}" ]]; then
+    red=$'\e[31m' green=$'\e[32m' bold=$'\e[1m' dim=$'\e[2m' reset=$'\e[0m'
+else
+    red='' green='' bold='' dim='' reset=''
+fi
+
+# Reading the sensor list from the BMC is slow, so read it once and reuse the copy.
+cache_dir=$(mktemp -d)
+trap 'rm -rf -- "$cache_dir"' EXIT
+if ! ipmitool sdr dump "$cache_dir/sdr" >/dev/null; then
+    echo "Could not read the sensor list from the BMC." >&2
+    exit 2
+fi
+ipmi() {
+    ipmitool -S "$cache_dir/sdr" "$@"
+}
+
+output=()
+problems=()
+
+trim() {
+    local value="$1"
+    value="${value#"${value%%[![:space:]]*}"}"
+    printf '%s' "${value%"${value##*[![:space:]]}"}"
+}
+
+# Add one section of `ipmitool sdr type` rows to the output.
+# Lines look like: Inlet Temp | 04h | ok | 7.1 | 23 degrees C
+add_sensors() {
+    local title="$1"
+    local type="$2"
+    local line name status entity reading label state colour
+    local -a lines=()
+    local -A seen=()
+
+    mapfile -t lines < <(ipmi sdr type "$type" 2>/dev/null | grep '|')
+    output+=("$bold$title$reset")
+    if ((${#lines[@]} == 0)); then
+        output+=("  ${dim}no sensors$reset")
+        return
+    fi
+
+    for line in "${lines[@]}"; do
+        IFS='|' read -r name _ status _ _ <<<"$line"
+        name=$(trim "$name")
+        seen[$name]=$((${seen[$name]-0} + 1))
+    done
+
+    for line in "${lines[@]}"; do
+        IFS='|' read -r name _ status entity reading <<<"$line"
+        name=$(trim "$name")
+        status=$(trim "$status")
+        entity=$(trim "$entity")
+        reading=$(trim "$reading")
+        reading=${reading/ degrees C/ °C}
+
+        # Several sensors can share a name, such as one "Temp" per CPU.
+        label=$name
+        if ((${seen[$name]} > 1)); then
+            label="$name #${entity#*.}"
+        fi
+
+        if [[ "$status" == ns ]]; then
+            state=n/a colour=$dim
+        elif [[ "$status" != ok || "${reading,,}" =~ fail|lost|error|degraded|insufficient ]]; then
+            # Discrete sensors, such as power supplies, stay "ok" and describe faults in the reading.
+            state=FAIL colour=$red
+            problems+=("$label")
+        else
+            state=ok colour=$green
+        fi
+        output+=("$(printf '  %s%-4s%s  %-24s  %s' "$colour" "$state" "$reset" "$label" "${reading:-no reading}")")
+    done
+}
+
+add_sensors Temperatures Temperature
+add_sensors Fans Fan
+add_sensors "Power supplies" "Power Supply"
+
+if ((${#problems[@]} == 0)); then
+    printf '%sHardware OK%s\n\n' "$green$bold" "$reset"
+else
+    names=$(printf ', %s' "${problems[@]}")
+    printf '%s%d sensor(s) need attention:%s %s\n\n' "$red$bold" "${#problems[@]}" "$reset" "${names:2}"
+fi
+printf '%s\n' "${output[@]}"
+
+# Lines look like: 1 | 06/12/2024 | 10:22:33 | Power Supply PS2 Status | Power Supply AC lost | Asserted
+printf '\n%sRecent events%s\n' "$bold" "$reset"
+mapfile -t lines < <(ipmi sel elist last "$events" 2>/dev/null)
+if ((${#lines[@]} == 0)) || [[ "${lines[0]}" != *'|'* ]]; then
+    echo "  ${dim}no events$reset"
+fi
+for line in "${lines[@]}"; do
+    [[ "$line" == *'|'* ]] || continue
+    IFS='|' read -r _ date time sensor event direction <<<"$line"
+    direction=$(trim "$direction")
+    printf '  %s %s  %s: %s%s\n' "$(trim "$date")" "$(trim "$time")" "$(trim "$sensor")" "$(trim "$event")" \
+        "${direction:+ ($direction)}"
+done
+
+((${#problems[@]} == 0)) || exit 1

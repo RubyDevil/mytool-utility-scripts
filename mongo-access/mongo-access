@@ -1,0 +1,551 @@
+#!/bin/bash
+
+# Test overrides; sudo resets the environment, so they never apply to a sudo run.
+conf=${MONGO_ACCESS_CONF:-/etc/mongod.conf}
+tag=mytool-mongo-access
+
+usage() {
+    cat >&2 <<'USAGE'
+Usage: mongo-access <command>
+
+  status                      Show who can reach MongoDB
+  public [ADDRESS]            Listen on all interfaces, or on ADDRESS (plus localhost)
+         [--allow-no-auth] [--no-firewall] [--yes]
+  private [--yes]             Listen on localhost only
+  allow <IP|CIDR>             Add an address to the access list
+  remove <IP|CIDR>            Remove an address from the access list
+  list                        Show the access list
+USAGE
+    exit 1
+}
+
+valid_ipv4() {
+    local octet
+    local -a octets
+
+    [[ "$1" =~ ^[0-9]+(\.[0-9]+){3}$ ]] || return 1
+    IFS=. read -ra octets <<<"$1"
+    for octet in "${octets[@]}"; do
+        # No leading zeros: some tools read 010 as octal.
+        [[ "$octet" =~ ^(0|[1-9][0-9]{0,2})$ ]] && ((octet <= 255)) || return 1
+    done
+}
+
+# Check an IPv4 or IPv6 address with an optional /prefix. Prints the canonical form.
+parse_source() {
+    local address="$1" prefix='' max=32
+
+    if [[ "$address" == */* ]]; then
+        prefix=${address#*/}
+        address=${address%/*}
+        [[ "$prefix" =~ ^[0-9]{1,3}$ ]] || return 1
+        prefix=$((10#$prefix))
+    fi
+    if valid_ipv4 "$address"; then
+        :
+    elif [[ "$address" =~ ^[0-9A-Fa-f]{0,4}(:[0-9A-Fa-f]{0,4}){2,7}$ ]]; then
+        max=128
+    else
+        return 1
+    fi
+    [[ -z "$prefix" ]] || ((prefix <= max)) || return 1
+    # A /32 or /128 is the same as the bare address, and ufw stores it that way.
+    ((prefix == max)) && prefix=''
+    printf '%s%s' "$address" "${prefix:+/$prefix}"
+}
+
+args=("$@")
+command=${1-}
+(($#)) && shift
+address='' target='' allow_no_auth=0 no_firewall=0 assume_yes=0
+
+case "$command" in
+    status | list)
+        (($# == 0)) || usage
+        ;;
+    private)
+        while (($#)); do
+            [[ "$1" == --yes ]] || usage
+            assume_yes=1
+            shift
+        done
+        ;;
+    public)
+        while (($#)); do
+            case "$1" in
+                --allow-no-auth) allow_no_auth=1 ;;
+                --no-firewall) no_firewall=1 ;;
+                --yes) assume_yes=1 ;;
+                -*) usage ;;
+                *)
+                    [[ -z "$address" ]] || usage
+                    valid_ipv4 "$1" || {
+                        echo "Not an IPv4 address: $1" >&2
+                        exit 1
+                    }
+                    address=$1
+                    ;;
+            esac
+            shift
+        done
+        [[ "$address" != 0.0.0.0 ]] || address=''
+        if [[ "$address" == 127.* ]]; then
+            echo "$address is a localhost address; use \"mongo-access private\"." >&2
+            exit 1
+        fi
+        ;;
+    allow | remove)
+        (($# == 1)) || usage
+        target=$(parse_source "$1") || {
+            echo "Not an IP address or CIDR range: $1" >&2
+            exit 1
+        }
+        if [[ "$target" == 0.0.0.0 || "$target" == :: || "$target" == */0 ]]; then
+            echo "That range is everyone. To allow anyone, use \"mongo-access public --no-firewall\"." >&2
+            exit 1
+        fi
+        ;;
+    *) usage ;;
+esac
+
+# Re-run as root; mytool installs a passwordless sudoers rule for this script.
+if ((EUID != 0)); then
+    exec sudo -- "$0" "${args[@]}"
+fi
+
+if [[ -t 1 && -z "${NO_COLOR-}" ]]; then
+    red=$'\e[31m' yellow=$'\e[33m' green=$'\e[32m' bold=$'\e[1m' reset=$'\e[0m'
+else
+    red='' yellow='' green='' bold='' reset=''
+fi
+
+die() {
+    printf '%s\n' "$1" >&2
+    exit "${2-1}"
+}
+
+row() {
+    printf '%s%-11s%s %s\n' "$bold" "$1" "$reset" "$2"
+}
+
+# Print a value from the config (or from the file $3): conf_get <section> <key> [file].
+# Quotes and trailing comments are removed; the exit status says whether the key exists.
+conf_get() {
+    local section='' line value
+
+    [[ -r "${3:-$conf}" ]] || return 1
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" =~ ^[[:space:]]*(#|$) ]] && continue
+        if [[ "$line" =~ ^([A-Za-z][A-Za-z0-9_]*):[[:space:]]*(#.*)?$ ]]; then
+            section=${BASH_REMATCH[1]}
+        elif [[ "$line" =~ ^[^[:space:]] ]]; then
+            section=''
+        elif [[ "$section" == "$1" && "$line" =~ ^[[:space:]]+"$2":[[:space:]]*([^#]*) ]]; then
+            value=${BASH_REMATCH[1]}
+            value=${value%"${value##*[![:space:]]}"}
+            value=${value//[\"\']/}
+            printf '%s' "$value"
+            return 0
+        fi
+    done <"${3:-$conf}"
+    return 1
+}
+
+# Copy the config from stdin to stdout with net.bindIp set to $1 and net.bindIpAll removed.
+# Everything else, comments included, stays as it was.
+render_conf() {
+    local bind="$1" section='' line has_bind=0
+    local -r bind_line='^([[:space:]]+)bindIp:[[:space:]]*([^#]*[^#[:space:]])?[[:space:]]*(#.*)?$'
+
+    conf_get net bindIp >/dev/null && has_bind=1
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" =~ ^([A-Za-z][A-Za-z0-9_]*):[[:space:]]*(#.*)?$ ]]; then
+            section=${BASH_REMATCH[1]}
+            printf '%s\n' "$line"
+            if [[ "$section" == net ]] && ((!has_bind)); then
+                printf '  bindIp: %s\n' "$bind"
+                has_bind=1
+            fi
+        elif [[ "$line" =~ ^[^[:space:]#] ]]; then
+            section=''
+            printf '%s\n' "$line"
+        elif [[ "$section" == net && "$line" =~ ^[[:space:]]+bindIpAll: ]]; then
+            continue
+        elif [[ "$section" == net && "$line" =~ $bind_line ]]; then
+            printf '%sbindIp: %s%s\n' "${BASH_REMATCH[1]}" "$bind" "${BASH_REMATCH[3]:+  ${BASH_REMATCH[3]}}"
+        else
+            printf '%s\n' "$line"
+        fi
+    done
+    ((has_bind)) || printf 'net:\n  bindIp: %s\n' "$bind"
+}
+
+# Print the addresses mongod is configured to listen on.
+configured_bind() {
+    if [[ "$(conf_get net bindIpAll)" == true ]]; then
+        printf '0.0.0.0'
+    else
+        conf_get net bindIp || printf '127.0.0.1'
+    fi
+}
+
+# Classify a comma-separated address list as public (all interfaces), restricted
+# (specific non-local addresses), or private (localhost only).
+classify() {
+    local item result=private
+    local -a items
+
+    IFS=, read -ra items <<<"$1"
+    for item in "${items[@]}"; do
+        item=${item//[[:space:]]/}
+        item=${item#[}
+        item=${item%]}
+        case "$item" in
+            '' | 127.* | ::1 | localhost | /*) ;;
+            0.0.0.0 | :: | '*')
+                printf public
+                return
+                ;;
+            *) result=restricted ;;
+        esac
+    done
+    printf '%s' "$result"
+}
+
+port() {
+    conf_get net port || printf 27017
+}
+
+# Print the addresses with something listening on the MongoDB port, one per line.
+listening() {
+    ss -Htln "sport = :$(port)" 2>/dev/null | awk '{ sub(/:[0-9]+$/, "", $4); print $4 }'
+}
+
+mongod_state() {
+    if ! command -v systemctl >/dev/null || ! systemctl cat mongod.service >/dev/null 2>&1; then
+        printf missing
+        return
+    fi
+    systemctl is-active mongod.service 2>/dev/null || true
+}
+
+auth_enabled() {
+    [[ "$(conf_get security authorization)" == enabled ]] || conf_get security keyFile >/dev/null
+}
+
+firewall_state() {
+    if ! command -v ufw >/dev/null; then
+        printf missing
+        return
+    fi
+    if [[ "$(ufw status 2>/dev/null | head -n 1)" == 'Status: active' ]]; then
+        printf active
+    else
+        printf inactive
+    fi
+}
+
+firewall_denies_by_default() {
+    ufw status verbose 2>/dev/null | grep -Eq '^Default: (deny|reject) \(incoming\)'
+}
+
+# Print the access list as "<source> <port>" lines.
+access_list() {
+    command -v ufw >/dev/null || return 0
+    ufw show added 2>/dev/null |
+        sed -n "s/^ufw allow from \([^ ]*\) to any port \([0-9]*\) proto tcp comment '$tag'\$/\1 \2/p"
+}
+
+# Print ufw rules, set up outside mongo-access, that open the MongoDB port to everyone.
+open_rules() {
+    command -v ufw >/dev/null || return 0
+    ufw show added 2>/dev/null | grep -E "^ufw allow( in)? ($(port)(/tcp)?|from any to any port $(port)( .*)?)( |\$)" || true
+}
+
+join() {
+    local IFS=,
+    printf '%s' "$*" | sed 's/,/, /g'
+}
+
+# Describe the access the config grants.
+describe_access() {
+    case "$(classify "$1")" in
+        public) printf '%sPUBLIC%s (all interfaces)' "$red$bold" "$reset" ;;
+        restricted) printf '%sRESTRICTED%s (%s, plus localhost)' "$yellow$bold" "$reset" "$1" ;;
+        *) printf '%sprivate%s (localhost only)' "$green" "$reset" ;;
+    esac
+}
+
+show_status() {
+    local bind state class listen_class fw entry rule_port line
+    local -a addresses=() entries=() warnings=()
+
+    [[ -r "$conf" ]] || die "Cannot read $conf; is MongoDB installed?" 2
+    bind=$(configured_bind)
+    class=$(classify "$bind")
+    state=$(mongod_state)
+    mapfile -t addresses < <(listening)
+    while read -r entry rule_port; do
+        [[ -n "$entry" ]] || continue
+        if [[ "$rule_port" == "$(port)" ]]; then
+            entries+=("$entry")
+        else
+            entries+=("$entry (port $rule_port)")
+        fi
+    done < <(access_list)
+
+    case "$state" in
+        active) row Service "${green}running$reset" ;;
+        missing) row Service "${red}mongod is not installed$reset" ;;
+        *) row Service "${yellow}$state$reset" ;;
+    esac
+    if ((${#addresses[@]})); then
+        row Listening "$(join "${addresses[@]/%/:$(port)}")"
+    else
+        row Listening nothing
+    fi
+    row Config "bindIp $bind"
+    row Access "$(describe_access "$bind")"
+    if auth_enabled; then
+        row Auth "${green}enabled$reset"
+    else
+        row Auth "${red}DISABLED$reset"
+    fi
+    fw=$(firewall_state)
+    case "$fw" in
+        active)
+            if firewall_denies_by_default; then
+                row Firewall "ufw active, blocks incoming connections by default"
+            else
+                row Firewall "${yellow}ufw active, but allows incoming connections by default$reset"
+            fi
+            ;;
+        inactive) row Firewall "${yellow}ufw installed but inactive$reset" ;;
+        *) row Firewall "${yellow}ufw not installed$reset" ;;
+    esac
+    if ((${#entries[@]})); then
+        row "Access list" "$(join "${entries[@]}")"
+    else
+        row "Access list" none
+    fi
+
+    if [[ "$state" == active && ${#addresses[@]} -gt 0 ]]; then
+        listen_class=$(classify "$(join "${addresses[@]}")")
+        if [[ "$listen_class" != "$class" ]]; then
+            warnings+=("mongod is listening on $(join "${addresses[@]}") but the config says $bind; restart mongod to apply it.")
+        fi
+    fi
+    if [[ "$class" != private ]]; then
+        auth_enabled || warnings+=("${red}Exposed without authentication: anyone who can reach port $(port) can read and delete all data.$reset")
+        if [[ "$fw" != active ]] || ! firewall_denies_by_default || ((${#entries[@]} == 0)); then
+            warnings+=("The access list is not enforced, so anyone who can reach this server can connect.")
+        fi
+    fi
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && warnings+=("\"$line\" opens port $(port) to everyone, which bypasses the access list.")
+    done < <(open_rules)
+    if ((${#warnings[@]})); then
+        printf '\n'
+        for line in "${warnings[@]}"; do
+            printf '%s!%s %s\n' "$yellow" "$reset" "$line"
+        done
+    fi
+}
+
+confirm() {
+    local answer
+
+    ((assume_yes)) && return 0
+    [[ -t 0 ]] || die "Restarting mongod needs confirmation; pass --yes to skip the prompt."
+    read -r -p "Restarting mongod drops its open connections for a few seconds. Continue? [y/N] " answer
+    [[ "${answer,,}" == y* ]] || die "Cancelled." 0
+}
+
+# Wait for mongod to listen on exactly the expected addresses.
+wait_for_listeners() {
+    local expected=",$1," attempt addr wildcard ok
+    local -a found
+
+    for ((attempt = 0; attempt < 40; attempt++)); do
+        if [[ "$(mongod_state)" == active ]]; then
+            mapfile -t found < <(listening)
+            ok=1 wildcard=0
+            for addr in "${found[@]}"; do
+                [[ "$addr" == '*' || "$addr" == 0.0.0.0 || "$addr" == '[::]' ]] && wildcard=1
+            done
+            if [[ "$expected" == *,0.0.0.0,* ]]; then
+                ((wildcard)) || ok=0
+            else
+                ((!wildcard)) || ok=0
+                for addr in ${expected//,/ }; do
+                    [[ " ${found[*]} " == *" $addr "* ]] || ok=0
+                done
+            fi
+            ((ok && ${#found[@]} > 0)) && return 0
+        fi
+        sleep 0.5
+    done
+    return 1
+}
+
+# Set net.bindIp to $1 and restart mongod; $2 lists the addresses it should end up listening on.
+# Restores the previous config if mongod does not come back as expected.
+apply_bind() {
+    local bind="$1" expected="$2" new_conf
+
+    new_conf=$(mktemp "$conf.XXXXXX") || die "Cannot write next to $conf."
+    trap 'rm -f -- "$new_conf"' EXIT
+    render_conf "$bind" <"$conf" >"$new_conf"
+    if [[ "$(conf_get net bindIp "$new_conf")" != "$bind" ]] || conf_get net bindIpAll "$new_conf" >/dev/null; then
+        die "Could not edit $conf; set net.bindIp to $bind by hand."
+    fi
+    cp -p -- "$conf" "$conf.mytool-backup"
+    chown --reference="$conf" -- "$new_conf"
+    chmod --reference="$conf" -- "$new_conf"
+    mv -f -- "$new_conf" "$conf"
+
+    echo "Restarting mongod..."
+    if systemctl restart mongod.service && wait_for_listeners "$expected"; then
+        return 0
+    fi
+    echo "mongod did not come back on the expected addresses; restoring the previous config." >&2
+    mv -f -- "$conf.mytool-backup" "$conf"
+    if ! systemctl restart mongod.service; then
+        die "Could not restart mongod with the previous config either; check \"journalctl -u mongod\"." 2
+    fi
+    return 1
+}
+
+check_service() {
+    [[ -r "$conf" ]] || die "Cannot read $conf; is MongoDB installed?" 2
+    [[ "$(mongod_state)" != missing ]] || die "The mongod service is not installed." 2
+    if grep -Eq '^net:[[:space:]]*[^[:space:]#]' "$conf"; then
+        die "The net section of $conf is written inline, which mongo-access cannot edit; change net.bindIp by hand." 2
+    fi
+}
+
+refuse() {
+    local bind
+
+    printf '%s\n' "$1" >&2
+    bind=$(configured_bind)
+    if [[ "$(classify "$bind")" != private ]]; then
+        printf 'MongoDB is currently bound to %s. Run "mongo-access private" to close it.\n' "$bind" >&2
+    fi
+    exit 1
+}
+
+make_public() {
+    local bind expected current rule fw
+    local -a allowed
+
+    check_service
+    if ! ((allow_no_auth)) && ! auth_enabled; then
+        refuse "Refusing to make MongoDB public: authentication is disabled, so anyone could read and delete the data.
+Enable it first: create an admin user with mongosh, then add to $conf:
+  security:
+    authorization: enabled
+To override this check, add --allow-no-auth (not recommended)."
+    fi
+    if ! ((no_firewall)); then
+        fw=$(firewall_state)
+        [[ "$fw" != missing ]] || refuse "Refusing to make MongoDB public: ufw is not installed, so the access list cannot be enforced.
+Install it with \"sudo apt-get install ufw\", or add --no-firewall to skip the access list."
+        mapfile -t allowed < <(access_list | awk -v port="$(port)" '$2 == port { print $1 }')
+        ((${#allowed[@]})) || refuse "Refusing to make MongoDB public: the access list is empty.
+Add the addresses that may connect with \"mongo-access allow <IP|CIDR>\", or add --no-firewall to allow anyone."
+        [[ "$fw" == active ]] || refuse "Refusing to make MongoDB public: ufw is not active, so the access list would not be enforced.
+Allow SSH, then enable it (\"sudo ufw allow OpenSSH && sudo ufw enable\"), or add --no-firewall."
+        firewall_denies_by_default || refuse "Refusing to make MongoDB public: ufw allows incoming connections by default, so the access list would not be enforced.
+Run \"sudo ufw default deny incoming\", or add --no-firewall."
+        while IFS= read -r rule; do
+            [[ -n "$rule" ]] && echo "${yellow}Warning:$reset \"$rule\" opens port $(port) to everyone, which bypasses the access list." >&2
+        done < <(open_rules)
+    fi
+
+    if [[ -n "$address" ]]; then
+        bind="127.0.0.1,$address"
+        expected="127.0.0.1,$address"
+    else
+        bind=0.0.0.0
+        expected=0.0.0.0
+    fi
+    current=$(configured_bind)
+    if [[ "${current//[[:space:]]/}" == "$bind" ]]; then
+        echo "MongoDB is already bound to $bind."
+        return
+    fi
+    confirm
+    apply_bind "$bind" "$expected" || die "MongoDB was not made public; the previous config is back in place."
+    printf 'MongoDB now listens on %s (port %s).\n' "$bind" "$(port)"
+    if ! auth_enabled; then
+        echo "${red}Authentication is disabled: anyone who can reach the port can read and delete all data.$reset"
+    fi
+}
+
+make_private() {
+    check_service
+    if [[ "$(classify "$(configured_bind)")" == private && "$(conf_get net bindIpAll)" != true ]]; then
+        echo "MongoDB is already private ($(configured_bind))."
+        return
+    fi
+    confirm
+    apply_bind 127.0.0.1 127.0.0.1 || die "MongoDB was not made private; the previous config is back in place."
+    echo "MongoDB now listens on localhost only (port $(port))."
+}
+
+require_ufw() {
+    command -v ufw >/dev/null || die "ufw is not installed; install it with \"sudo apt-get install ufw\"." 2
+}
+
+in_access_list() {
+    access_list | grep -Fqx -- "$1 $(port)"
+}
+
+allow_source() {
+    require_ufw
+    if in_access_list "$target"; then
+        echo "$target is already in the access list."
+        return
+    fi
+    ufw allow from "$target" to any port "$(port)" proto tcp comment "$tag" >/dev/null || die "ufw could not add the rule."
+    echo "Added $target to the access list (port $(port))."
+    if [[ "$(firewall_state)" != active ]]; then
+        echo "${yellow}ufw is not active, so the rule only applies once you enable it.$reset"
+        echo "Allow SSH first: sudo ufw allow OpenSSH && sudo ufw enable"
+    fi
+}
+
+remove_source() {
+    require_ufw
+    in_access_list "$target" || die "$target is not in the access list."
+    ufw delete allow from "$target" to any port "$(port)" proto tcp >/dev/null || die "ufw could not remove the rule."
+    echo "Removed $target from the access list."
+    if [[ -z "$(access_list)" && "$(classify "$(configured_bind)")" != private ]]; then
+        echo "${yellow}The access list is now empty, so nobody can connect remotely.$reset"
+    fi
+}
+
+show_list() {
+    local entry rule_port any=0
+
+    while read -r entry rule_port; do
+        [[ -n "$entry" ]] || continue
+        any=1
+        if [[ "$rule_port" == "$(port)" ]]; then
+            echo "$entry"
+        else
+            echo "$entry (port $rule_port, not the current MongoDB port)"
+        fi
+    done < <(access_list)
+    ((any)) || echo "The access list is empty."
+}
+
+case "$command" in
+    status) show_status ;;
+    list) show_list ;;
+    public) make_public ;;
+    private) make_private ;;
+    allow) allow_source ;;
+    remove) remove_source ;;
+esac

@@ -2,23 +2,24 @@
 
 if [[ $# -eq 1 && ("$1" == -h || "$1" == --help) ]]; then
     cat <<'HELP'
-Show a one-screen hardware health snapshot through IPMI: temperatures, fans,
-power supplies, and the latest system event log entries.
+Usage: ipmi-status [EVENTS]
 
-Usage:
-  ipmi-status [EVENTS]
+Show a health snapshot of the server hardware through IPMI.
 
-  EVENTS   How many recent log entries to show, 1-100 (default 5)
+Arguments:
+  EVENTS         Number of recent log events to show, 1-100 (default: 5)
+
+Options:
+  -h, --help     Show this help and exit
 
 Examples:
   ipmi-status
   ipmi-status 20
 
-Sensors are marked ok, FAIL, or n/a (no reading, such as an empty slot).
-Exit status: 0 when every sensor is OK, 1 when a sensor needs attention,
-2 when the sensors cannot be read or the arguments are wrong.
-
-Members of the sudo, admin, or wheel group can run it without typing sudo.
+Exit status:
+  0              Every sensor is OK
+  1              A sensor needs attention
+  2              The sensors could not be read, or the arguments are wrong
 HELP
     exit 0
 fi

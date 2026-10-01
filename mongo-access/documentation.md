@@ -1,20 +1,7 @@
 Make MongoDB reachable from other machines, or keep it on localhost, and control which addresses may connect.
 
-Usage:
-  mongo-access status
-  mongo-access public [ADDRESS] [--allow-no-auth] [--no-firewall] [--yes]
-  mongo-access private [--yes]
-  mongo-access allow <IP|CIDR>
-  mongo-access remove <IP|CIDR>
-  mongo-access list
-
-Examples:
-  mongo-access allow 203.0.113.5       Let one address connect
-  mongo-access allow 198.51.100.0/24   Let a range connect
-  mongo-access public                  Listen on all interfaces
-  mongo-access public 10.0.0.5         Listen on 10.0.0.5, plus localhost
-  mongo-access private                 Listen on localhost only
-  mongo-access status                  Show who can reach MongoDB
+What it's for:
+  MongoDB listens on localhost only, which is the safe default. When an application on another server needs to connect, it has to listen on a network address, and a database exposed to the internet without protection is quickly found and wiped. mongo-access makes that change in one step, refuses to do it unsafely, and keeps an access list of the addresses that may connect.
 
 How it works:
   public and private change net.bindIp in /etc/mongod.conf, then restart mongod. The rest of the file, comments included, is left alone. The previous file is kept as /etc/mongod.conf.mytool-backup, and is put back if mongod does not come back listening on the expected addresses.
@@ -39,10 +26,12 @@ Access list:
   A ufw rule that opens the port to everyone, such as "ufw allow 27017", bypasses the access list. status and public warn when they find one. Only ufw is supported; servers using firewalld or hand-written nftables rules need --no-firewall and their own rules.
 
 Status:
-  status shows the service state, the addresses mongod is really listening on (not just what the config says), the config value, authentication, the firewall, and the access list, followed by warnings: no authentication, an access list that is not enforced, or a config change that has not been applied by a restart.
+  mongo-access status shows the service state, the addresses mongod is really listening on (not just what the config says), the config value, authentication, the firewall, and the access list, followed by warnings: no authentication, an access list that is not enforced, or a config change that has not been applied by a restart.
 
 Permissions:
   Any member of the sudo, admin, or wheel group can run mongo-access without a password. The script re-runs itself through sudo, so there is no need to type sudo.
 
 Setup:
   Installing mongo-access also installs ufw when it is missing (it stays disabled) and writes /etc/sudoers.d/mytool-mongo-access after validating it with visudo. Uninstalling removes that rule. The ufw rules and the MongoDB configuration are left as they are.
+
+Run mongo-access --help for the commands and options.

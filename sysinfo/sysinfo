@@ -3,15 +3,15 @@
 
 if [[ $# -eq 1 && ("$1" == -h || "$1" == --help) ]]; then
     cat <<'HELP'
-Show a short status summary of the server, meant to be run after logging in.
+Usage: sysinfo
 
-Usage:
-  sysinfo
+Show a short status summary of the server.
 
-Shows the uptime, load, memory, swap, disk usage, failed systemd units,
-pending package updates, and whether a reboot is needed. Sections whose
-tools are missing are skipped. Values turn yellow, then red, as they near
-their limits. It needs no root and does not use sudo.
+Options:
+  -h, --help     Show this help and exit
+
+Environment:
+  NO_COLOR       Set to disable colors
 HELP
     exit 0
 fi

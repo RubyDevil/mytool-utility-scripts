@@ -1,17 +1,12 @@
-Set the speed of every server fan through IPMI, or hand control back to the iDRAC.
+Control how fast the server fans spin, through IPMI.
 
-Usage:
-  fan-speed <0-100|auto>
+What it's for:
+  Dell PowerEdge servers (iDRAC) run their fans from the temperatures they read, which can be louder or hotter than you want. fan-speed pins every fan to a speed you choose, for example to quiet a server in a home or office, or to hand control back to the iDRAC when you are done.
 
-Examples:
-  fan-speed 30     Run all fans at 30%
-  fan-speed 100    Run all fans at full speed
-  fan-speed auto   Return the fans to the iDRAC's automatic control
+What it does:
+  Giving a number switches the fan controller to manual mode and applies that duty cycle to every fan. The fans then keep that speed whatever the temperature, until you change it. A low value on a busy server can overheat it, so check the temperatures afterwards with a tool such as ipmi-status.
 
-How it works:
-  A number switches the fan controller to manual mode, then applies that duty cycle to every fan. The fans stay at that speed, whatever the temperature, until you run fan-speed again.
-
-  auto switches the fan controller back to automatic mode, where the iDRAC adjusts the fans to the temperatures it reads.
+  auto switches the controller back to automatic mode, where the iDRAC adjusts the fans to the temperatures it reads.
 
   It uses Dell PowerEdge (iDRAC) raw IPMI commands, so other vendors need different raw codes.
 
@@ -20,3 +15,5 @@ Permissions:
 
 Setup:
   Installing fan-speed also installs ipmitool when it is missing and writes /etc/sudoers.d/mytool-fan-speed after validating it with visudo. Uninstalling removes that rule.
+
+Run fan-speed --help for the command-line options.

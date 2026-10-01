@@ -1,7 +1,7 @@
-Show a short status summary of the server, meant to be run right after logging in.
+A short status summary of the server, meant to be run right after logging in.
 
-Usage:
-  sysinfo
+What it's for:
+  When you log in to a server you usually want the same few answers: is it healthy, is anything broken, does it need attention? sysinfo gives them in one screen, on Debian and Ubuntu servers whether they are VPSes or bare metal, without needing root.
 
 What it shows:
   The host name, operating system, kernel, and whether it runs on bare metal or in a virtual machine, then:
@@ -17,7 +17,7 @@ What it shows:
 
   Values turn yellow, then red, as they approach their limit: load above 70% then 100% of the CPU count, memory above 80% then 90%, swap above 50% then 80%, and disks above 80% then 90%.
 
-Notes:
+Good to know:
   Sections are skipped when their tools are missing, for example Services on a server or container without systemd, and Updates outside Debian and Ubuntu.
 
   Updates are counted from the package lists of the last "apt update", which sysinfo does not run. Ubuntu's update-notifier counts security updates exactly; elsewhere they are estimated from the security repositories.

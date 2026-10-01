@@ -2,20 +2,21 @@
 
 if [[ $# -eq 1 && ("$1" == -h || "$1" == --help) ]]; then
     cat <<'HELP'
+Usage: fan-speed <0-100|auto>
+
 Set the speed of every server fan through IPMI (Dell iDRAC).
 
-Usage:
-  fan-speed <0-100|auto>
+Arguments:
+  0-100          Run every fan at this percentage
+  auto           Hand fan control back to the iDRAC
 
-  0-100   Run every fan at that percentage, whatever the temperature
-  auto    Hand fan control back to the iDRAC
+Options:
+  -h, --help     Show this help and exit
 
 Examples:
   fan-speed 30
   fan-speed 100
   fan-speed auto
-
-Members of the sudo, admin, or wheel group can run it without typing sudo.
 HELP
     exit 0
 fi

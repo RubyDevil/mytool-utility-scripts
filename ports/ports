@@ -2,15 +2,16 @@
 
 if [[ $# -eq 1 && ("$1" == -h || "$1" == --help) ]]; then
     cat <<'HELP'
-Show what is listening on the server: each port and protocol, the address it
-is reachable on, the process behind it, and the systemd service that owns it.
+Usage: ports
 
-Usage:
-  ports
+List the ports the server is listening on, with the process and
+systemd service behind each one.
 
-ADDRESS is "all interfaces" for ports open to the network, "localhost" for
-ports only the server can reach, or the specific address. Without root, the
-process behind other users' ports shows as "?"; run "sudo ports" to see them.
+Options:
+  -h, --help     Show this help and exit
+
+Environment:
+  NO_COLOR       Set to disable colors
 HELP
     exit 0
 fi

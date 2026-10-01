@@ -6,22 +6,24 @@ tag=mytool-mongo-access
 
 show_help() {
     cat <<'HELP'
-Make MongoDB reachable from other machines, or keep it on localhost, and
-control which addresses may connect.
+Usage: mongo-access <command> [options]
 
-Usage:
-  mongo-access status                  Show who can reach MongoDB
-  mongo-access public [ADDRESS]        Listen on all interfaces, or on ADDRESS
-                                       (plus localhost)
-  mongo-access private                 Listen on localhost only
-  mongo-access allow <IP|CIDR>         Add an address to the access list
-  mongo-access remove <IP|CIDR>        Remove an address from the access list
-  mongo-access list                    Show the access list
+Control whether MongoDB is reachable from other machines.
+
+Commands:
+  status                   Show who can reach MongoDB
+  public [ADDRESS]         Listen on all interfaces, or on ADDRESS plus localhost
+  private                  Listen on localhost only
+  allow <IP|CIDR>          Add an address to the access list
+  remove <IP|CIDR>         Remove an address from the access list
+  list                     Show the access list
+  help                     Show this help and exit
 
 Options:
-  --yes             Restart mongod without asking (public, private)
-  --allow-no-auth   Let public run without authentication enabled (public)
-  --no-firewall     Let public run without an enforced access list (public)
+  --yes                    Restart mongod without asking (public, private)
+  --allow-no-auth          Allow public without authentication enabled
+  --no-firewall            Allow public without an enforced access list
+  -h, --help               Show this help and exit
 
 Examples:
   mongo-access allow 203.0.113.5
@@ -29,13 +31,6 @@ Examples:
   mongo-access public
   mongo-access public 10.0.0.5
   mongo-access private
-
-public refuses unless authentication is enabled and the access list is
-enforced by an active ufw that blocks incoming connections by default; the
-two options above skip those checks. It edits net.bindIp in /etc/mongod.conf,
-restarts mongod, and restores the old config if mongod does not come back.
-
-Members of the sudo, admin, or wheel group can run it without typing sudo.
 HELP
 }
 

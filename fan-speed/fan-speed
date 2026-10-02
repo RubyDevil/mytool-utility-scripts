@@ -1,19 +1,49 @@
 #!/bin/bash
 
-if [[ $# -ne 1 || ! "$1" =~ ^[0-9]{1,3}$ ]] || ((10#$1 > 100)); then
-    echo "Usage: fan-speed 0-100"
+if [[ $# -eq 1 && ("$1" == -h || "$1" == --help) ]]; then
+    cat <<'HELP'
+Usage: fan-speed <0-100|auto>
+
+Set the speed of every server fan through IPMI (Dell iDRAC).
+
+Arguments:
+  0-100          Run every fan at this percentage
+  auto           Hand fan control back to the iDRAC
+
+Options:
+  -h, --help     Show this help and exit
+
+Examples:
+  fan-speed 30
+  fan-speed 100
+  fan-speed auto
+HELP
+    exit 0
+fi
+
+if [[ $# -eq 1 && "$1" == auto ]]; then
+    mode=auto
+elif [[ $# -eq 1 && "$1" =~ ^[0-9]{1,3}$ ]] && ((10#$1 <= 100)); then
+    # Force base 10 so values such as 08 are not read as octal.
+    mode=$((10#$1))
+else
+    echo "Usage: fan-speed <0-100|auto>  (see fan-speed --help)" >&2
     exit 1
 fi
 
-# Force base 10 so values such as 08 are not read as octal.
-speed=$((10#$1))
-
 # Re-run as root; mytool installs a passwordless sudoers rule for this script.
 if ((EUID != 0)); then
-    exec sudo -- "$0" "$speed"
+    exec sudo -- "$0" "$mode"
 fi
 
-hex=$(printf '%02x' "$speed")
+if [[ "$mode" == auto ]]; then
+    # Hand fan control back to the iDRAC
+    ipmitool raw 0x30 0x30 0x01 0x01
+    echo "Fan speed set to automatic"
+    exit
+fi
+
+hex=$(printf '%02x' "$mode")
 
 # Enable manual fan control
 ipmitool raw 0x30 0x30 0x01 0x00
@@ -21,4 +51,4 @@ ipmitool raw 0x30 0x30 0x01 0x00
 # Set all fans to requested percentage
 ipmitool raw 0x30 0x30 0x02 0xff "0x$hex"
 
-echo "Fan speed set to ${speed}%"
+echo "Fan speed set to ${mode}%"

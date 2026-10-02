@@ -8,7 +8,11 @@ install, uninstall, and update them.
 
 | Script | Description |
 | --- | --- |
-| [fan-speed](fan-speed/documentation.md) | Set the speed of every server fan through IPMI (Dell iDRAC). |
+| [fan-speed](fan-speed/documentation.md) | Set the speed of every server fan through IPMI (Dell iDRAC), or return it to automatic. |
+| [ipmi-status](ipmi-status/documentation.md) | Show a hardware health snapshot through IPMI: temperatures, fans, power supplies, and recent events. |
+| [mongo-access](mongo-access/documentation.md) | Make MongoDB public or private, with an IP access list enforced by ufw. |
+| [ports](ports/documentation.md) | Show each listening port with its address, process, and systemd service. |
+| [sysinfo](sysinfo/documentation.md) | Show a login summary: uptime, load, memory, disks, failed services, updates, and reboot status. |
 
 ## Layout
 
@@ -26,3 +30,4 @@ install, uninstall, and update them.
 - Updating a script runs the installed version's `uninstall.sh`, then the new version's `install.sh`.
 - Without `documentation.md`, mytool shows the output of `<name> --help`, so scripts without a
   documentation file must handle `--help` without side effects.
+- Every script here also prints a short usage with `--help`, for use on the server itself.

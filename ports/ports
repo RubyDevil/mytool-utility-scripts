@@ -1,0 +1,145 @@
+#!/bin/bash
+
+if [[ $# -eq 1 && ("$1" == -h || "$1" == --help) ]]; then
+    cat <<'HELP'
+Usage: ports
+
+List the ports the server is listening on, with the process and
+systemd service behind each one.
+
+Options:
+  -h, --help     Show this help and exit
+
+Environment:
+  NO_COLOR       Set to disable colors
+HELP
+    exit 0
+fi
+
+if [[ $# -ne 0 ]]; then
+    echo "Usage: ports  (see ports --help)" >&2
+    exit 1
+fi
+
+if ! command -v ss >/dev/null; then
+    echo "ss is not installed; install the iproute2 package." >&2
+    exit 1
+fi
+
+if [[ -t 1 && -z "${NO_COLOR-}" ]]; then
+    yellow=$'\e[33m' bold=$'\e[1m' dim=$'\e[2m' reset=$'\e[0m'
+else
+    yellow='' bold='' dim='' reset=''
+fi
+
+# Print the systemd unit a process runs in, from a cgroup path such as
+# /system.slice/nginx.service or /system.slice/system-postgresql.slice/postgresql@16-main.service.
+unit_of() {
+    local path unit=''
+    local -a parts
+
+    # cgroup v2 uses the "0::" line; v1 keeps the systemd hierarchy under name=systemd.
+    path=$(awk -F: '$1 == "0" || $2 == "name=systemd" { print $3; exit }' "/proc/$1/cgroup" 2>/dev/null) || return
+    IFS=/ read -ra parts <<<"$path"
+    for part in "${parts[@]}"; do
+        [[ "$part" == *.service || "$part" == *.scope ]] && unit=$part
+    done
+    printf '%s' "$unit"
+}
+
+# Describe a listening address: all interfaces, localhost, or the address itself.
+describe() {
+    local address="$1" device=''
+
+    if [[ "$address" == *%* ]]; then
+        device=${address#*%}
+        address=${address%%\%*}
+    fi
+    address=${address#[}
+    address=${address%]}
+    case "$address" in
+        0.0.0.0 | :: | '*') printf '%s' "${device:-all interfaces}" ;;
+        127.* | ::1 | ::ffff:127.*) printf 'localhost' ;;
+        *) printf '%s' "$address" ;;
+    esac
+}
+
+# Socket-activated ports are held by systemd itself, so ask it which socket unit owns them.
+declare -A socket_units=()
+if command -v systemctl >/dev/null && [[ -d /run/systemd/system ]]; then
+    while read -r listen type unit _; do
+        case "$type" in
+            Stream) socket_units["tcp ${listen##*:}"]=$unit ;;
+            Datagram) socket_units["udp ${listen##*:}"]=$unit ;;
+        esac
+    done < <(systemctl list-sockets --show-types --no-legend --plain 2>/dev/null)
+fi
+
+declare -A addresses=()
+hidden=0
+
+# Lines look like: tcp LISTEN 0 4096 0.0.0.0:22 0.0.0.0:* users:(("sshd",pid=812,fd=3))
+while read -r protocol _ _ _ listen_address _ users; do
+    [[ "$protocol" == tcp || "$protocol" == udp ]] || continue
+    port=${listen_address##*:}
+    process='' pid='' service=''
+
+    rest=$users
+    while [[ "$rest" =~ \(\"([^\"]*)\",pid=([0-9]+) ]]; do
+        [[ " $process " == *" ${BASH_REMATCH[1]} "* ]] || process+="${process:+ }${BASH_REMATCH[1]}"
+        pid=${pid:-${BASH_REMATCH[2]}}
+        rest=${rest#*"${BASH_REMATCH[0]}"}
+    done
+
+    if [[ -n "$pid" ]]; then
+        service=$(unit_of "$pid")
+        process+=" ($pid)"
+    fi
+    if [[ -z "$service" || "$service" == init.scope ]]; then
+        service=${socket_units["$protocol $port"]-$service}
+    fi
+    if [[ -z "$process" ]]; then
+        process='?'
+        hidden=1
+    fi
+
+    # IPv4 and IPv6 listeners of the same process share a row.
+    key="$port"$'\t'"$protocol"$'\t'"$process"$'\t'"${service:--}"
+    address=$(describe "${listen_address%:*}")
+    [[ ", ${addresses[$key]-}, " == *", $address, "* ]] ||
+        addresses[$key]+="${addresses[$key]:+, }$address"
+done < <(ss -tulpn 2>/dev/null)
+
+if ((${#addresses[@]} == 0)); then
+    echo "Nothing is listening."
+    exit
+fi
+
+rows=()
+port_width=4 address_width=7 process_width=7
+while IFS=$'\t' read -r port protocol process service; do
+    key="$port"$'\t'"$protocol"$'\t'"$process"$'\t'"$service"
+    rows+=("$port/$protocol"$'\t'"${addresses[$key]}"$'\t'"$process"$'\t'"$service")
+    port="$port/$protocol"
+    ((${#port} > port_width)) && port_width=${#port}
+    ((${#addresses[$key]} > address_width)) && address_width=${#addresses[$key]}
+    ((${#process} > process_width)) && process_width=${#process}
+done < <(printf '%s\n' "${!addresses[@]}" | sort -t $'\t' -k1,1n -k2,2)
+
+printf '%s%-*s  %-*s  %-*s  %s%s\n' "$bold" "$port_width" PORT "$address_width" ADDRESS "$process_width" PROCESS SERVICE "$reset"
+for row in "${rows[@]}"; do
+    IFS=$'\t' read -r port address process service <<<"$row"
+    # Pad before colouring so escape codes do not break the alignment.
+    address=$(printf '%-*s' "$address_width" "$address")
+    case "$address" in
+        "all interfaces"*) address="$yellow$address$reset" ;;
+        localhost*) address="$dim$address$reset" ;;
+    esac
+    process=$(printf '%-*s' "$process_width" "$process")
+    [[ "$process" == '?'* ]] && process="$dim$process$reset"
+    printf '%-*s  %s  %s  %s\n' "$port_width" "$port" "$address" "$process" "$service"
+done
+
+if ((hidden && EUID != 0)); then
+    printf '\n%sRun "sudo ports" to see the process behind every port.%s\n' "$dim" "$reset"
+fi

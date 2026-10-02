@@ -1,0 +1,560 @@
+#!/bin/bash
+
+if [[ $# -eq 1 && ("$1" == -h || "$1" == --help) ]]; then
+    cat <<'HELP'
+Usage: schedule
+
+List everything scheduled to run on the server, soonest first: cron jobs,
+systemd timers, and at jobs.
+
+Options:
+  -h, --help     Show this help and exit
+
+Environment:
+  NO_COLOR       Set to disable colors
+HELP
+    exit 0
+fi
+
+if [[ $# -ne 0 ]]; then
+    echo "Usage: schedule  (see schedule --help)" >&2
+    exit 1
+fi
+
+if [[ -t 1 && -z "${NO_COLOR-}" ]]; then
+    yellow=$'\e[33m' bold=$'\e[1m' dim=$'\e[2m' reset=$'\e[0m'
+else
+    yellow='' bold='' dim='' reset=''
+fi
+
+# Test overrides: a prefix for the system paths, and the current time.
+root=${SCHEDULE_ROOT-}
+now=${SCHEDULE_NOW:-$(printf '%(%s)T' -1)}
+unknown=9999999999
+
+printf -v clock '%(%H %M %S)T' "$now"
+read -r clock_hour clock_minute clock_second <<<"$clock"
+clock_hour=$((10#$clock_hour)) clock_minute=$((10#$clock_minute)) clock_second=$((10#$clock_second))
+# Noon is far from midnight, so adding whole days keeps the calendar date right across daylight saving changes.
+noon=$((now - clock_hour * 3600 - clock_minute * 60 - clock_second + 43200))
+
+rows=()
+warnings=()
+expansions=()
+declare -A expanded=()
+cron_count=0 timer_count=0 at_count=0
+
+# Print the values a cron field matches, in order: cron_field <field> <min> <max> <names> <base>.
+# <names> lists the month or weekday names, numbered from <base>.
+cron_field() {
+    local field=${1,,} min=$2 max=$3 names=$4 base=$5
+    local part range step low high value i
+    local -a parts name_list=()
+    local -A on=()
+
+    read -ra name_list <<<"$names"
+    for i in "${!name_list[@]}"; do
+        field=${field//${name_list[i]}/$((i + base))}
+    done
+    [[ "$field" =~ ^[0-9*/,-]+$ ]] || return 1
+
+    IFS=, read -ra parts <<<"$field"
+    for part in "${parts[@]}"; do
+        range=${part%%/*}
+        step=1
+        if [[ "$part" == */* ]]; then
+            step=${part#*/}
+            [[ "$step" =~ ^[0-9]+$ ]] && ((10#$step > 0)) || return 1
+            step=$((10#$step))
+        fi
+        if [[ "$range" == '*' ]]; then
+            low=$min high=$max
+        elif [[ "$range" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+            low=$((10#${BASH_REMATCH[1]})) high=$((10#${BASH_REMATCH[2]}))
+        elif [[ "$range" =~ ^[0-9]+$ ]]; then
+            low=$((10#$range))
+            high=$low
+            ((step > 1)) && high=$max
+        else
+            return 1
+        fi
+        ((low >= min && high <= max && low <= high)) || return 1
+        for ((value = low; value <= high; value += step)); do
+            on[$value]=1
+        done
+    done
+    # Weekday 7 is Sunday, the same as 0.
+    ((max == 7)) && [[ -n "${on[7]-}" ]] && on[0]=1
+    for ((value = min; value <= max; value++)); do
+        [[ -n "${on[$value]-}" ]] && printf '%s ' "$value"
+    done
+    return 0
+}
+
+# Find the next time a cron schedule fires, from five fields: cron_next <m> <h> <dom> <mon> <dow>.
+# Sets next_text to "YYYY-MM-DD HH:MM". Returns 1 if the schedule never fires, 2 if it is invalid.
+cron_next() {
+    local minutes hours days months weekdays
+    local dom_any=0 dow_any=0 offset day parts year month date weekday hour minute
+
+    minutes=$(cron_field "$1" 0 59 '' 0) || return 2
+    hours=$(cron_field "$2" 0 23 '' 0) || return 2
+    days=$(cron_field "$3" 1 31 '' 1) || return 2
+    months=$(cron_field "$4" 1 12 'jan feb mar apr may jun jul aug sep oct nov dec' 1) || return 2
+    weekdays=$(cron_field "$5" 0 7 'sun mon tue wed thu fri sat' 0) || return 2
+    [[ -n "$minutes" && -n "$hours" && -n "$days" && -n "$months" && -n "$weekdays" ]] || return 2
+    [[ "$3" == \** ]] && dom_any=1
+    [[ "$5" == \** ]] && dow_any=1
+
+    # Four years covers a schedule that only fires on February 29.
+    for ((offset = 0; offset <= 1461; offset++)); do
+        printf -v parts '%(%Y %m %d %w)T' $((noon + offset * 86400))
+        read -r year month date weekday <<<"$parts"
+        [[ " $months " == *" $((10#$month)) "* ]] || continue
+        # With both day fields restricted, a day matches either one; otherwise it must match both.
+        if ((dom_any || dow_any)); then
+            [[ " $days " == *" $((10#$date)) "* && " $weekdays " == *" $weekday "* ]] || continue
+        else
+            [[ " $days " == *" $((10#$date)) "* || " $weekdays " == *" $weekday "* ]] || continue
+        fi
+        for hour in $hours; do
+            ((offset == 0 && hour < clock_hour)) && continue
+            for minute in $minutes; do
+                ((offset == 0 && hour == clock_hour && minute <= clock_minute)) && continue
+                printf -v next_text '%04d-%02d-%02d %02d:%02d' "$year" "$((10#$month))" "$((10#$date))" "$hour" "$minute"
+                return 0
+            done
+        done
+    done
+    return 1
+}
+
+duration() {
+    local seconds=$1
+
+    if ((seconds <= 0)); then
+        printf now
+    elif ((seconds < 60)); then
+        printf '<1m'
+    elif ((seconds < 3600)); then
+        printf '%dm' $((seconds / 60))
+    elif ((seconds < 86400)); then
+        printf '%dh %dm' $((seconds / 3600)) $((seconds % 3600 / 60))
+    else
+        printf '%dd %dh' $((seconds / 86400)) $((seconds % 86400 / 3600))
+    fi
+}
+
+# Add a row to the table: add_row <next_text> <label> <schedule> <user> <source> <command>.
+# <next_text> is a time that date understands; <label> is shown when there is no next time.
+add_row() {
+    local next_text=$1 label=$2 schedule=$3 owner=$4 source=$5 command=$6
+    local epoch=$unknown in='-' next=$label parsed dow month_day hm
+
+    if [[ -n "$next_text" ]] && parsed=$(date -d "$next_text" '+%s|%a|%b %d|%H:%M' 2>/dev/null); then
+        IFS='|' read -r epoch dow month_day hm <<<"$parsed"
+        in=$(duration $((epoch - now)))
+        if ((epoch - now < 6 * 86400)); then
+            next="$dow $hm"
+        else
+            next="$month_day $hm"
+        fi
+    fi
+    command=${command//$'\t'/ }
+    rows+=("$epoch"$'\t'"${#rows[@]}"$'\t'"$in"$'\t'"$next"$'\t'"$schedule"$'\t'"$owner"$'\t'"$source"$'\t'"$command")
+}
+
+cron_alias() {
+    case "$1" in
+        @hourly) printf '0 * * * *' ;;
+        @daily | @midnight) printf '0 0 * * *' ;;
+        @weekly) printf '0 0 * * 0' ;;
+        @monthly) printf '0 0 1 * *' ;;
+        @yearly | @annually) printf '0 0 1 1 *' ;;
+        *) return 1 ;;
+    esac
+}
+
+# Work out when a cron schedule next fires; sets next_text and next_label.
+resolve_schedule() {
+    local spec=$1 fields status=0
+    local -a parts
+
+    next_text='' next_label='-'
+    if [[ "$spec" == @reboot ]]; then
+        next_label='at boot'
+        return
+    fi
+    if [[ "$spec" == @* ]]; then
+        fields=$(cron_alias "$spec") || {
+            next_label='?'
+            return
+        }
+    else
+        fields=$spec
+    fi
+    read -ra parts <<<"$fields"
+    cron_next "${parts[@]}" || status=$?
+    ((status == 1)) && next_label='never'
+    ((status == 2)) && next_label='?'
+}
+
+# Add the job on one crontab line: add_cron_line <source> <owner or -> <line>.
+# An owner of "-" means the line has a user column, as in /etc/crontab and /etc/cron.d.
+add_cron_line() {
+    local source=$1 owner=$2 line=$3 spec user command directory anacron=0 where=$1
+    local -a fields
+
+    [[ "$owner" == - ]] || where="crontab of $owner"
+
+    read -ra fields <<<"$line"
+    ((${#fields[@]})) || return 0
+    [[ "${fields[0]}" == \#* ]] && return 0
+    # Environment lines such as MAILTO=root.
+    [[ "$line" =~ ^[[:space:]]*[A-Za-z_][A-Za-z0-9_]*[[:space:]]*= ]] && return 0
+
+    if [[ "${fields[0]}" == @* ]]; then
+        spec=${fields[0]}
+        set -- "${fields[@]:1}"
+    else
+        ((${#fields[@]} >= 5)) || {
+            warnings+=("$where: cannot read the line \"$line\".")
+            return 0
+        }
+        spec="${fields[*]:0:5}"
+        set -- "${fields[@]:5}"
+    fi
+    if [[ "$owner" == - ]]; then
+        (($# >= 2)) || {
+            warnings+=("$where: cannot read the line \"$line\".")
+            return 0
+        }
+        user=$1
+        shift
+    else
+        user=$owner
+    fi
+    (($# >= 1)) || {
+        warnings+=("$where: cannot read the line \"$line\".")
+        return 0
+    }
+    command="$*"
+
+    # run-parts lines stand for the scripts in a cron.* directory; those are listed one by one.
+    if [[ "$command" == *run-parts* && "$command" =~ /etc/cron\.(hourly|daily|weekly|monthly) ]]; then
+        directory=${BASH_REMATCH[1]}
+        if [[ "$command" == *'test -x /usr/sbin/anacron'* && -x "$root/usr/sbin/anacron" ]]; then
+            anacron=1
+        fi
+        expansions+=("$directory|$spec|$anacron|$user")
+        return 0
+    fi
+
+    resolve_schedule "$spec"
+    if [[ "$next_label" == '?' ]]; then
+        warnings+=("$where: the schedule \"$spec\" is not valid.")
+    fi
+    add_row "$next_text" "$next_label" "$spec" "$user" "$source" "$command"
+    cron_count=$((cron_count + 1))
+}
+
+read_cron_file() {
+    local file=$1 source=$2 owner=$3 line
+
+    [[ -r "$file" ]] || return 0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        add_cron_line "$source" "$owner" "$line"
+    done <"$file"
+}
+
+# Cron skips some files in /etc/cron.d without saying so; Debian's cron is the strict one.
+cron_d_is_ignored() {
+    local file=$1 name mode owner
+
+    [[ -e "$root/etc/debian_version" ]] || return 1
+    name=${file##*/}
+    if [[ ! "$name" =~ ^[A-Za-z0-9_-]+$ ]]; then
+        warnings+=("$file is ignored by cron: its name may only use letters, digits, _ and -.")
+        return 0
+    fi
+    read -r mode owner < <(stat -c '%a %U' -- "$file" 2>/dev/null)
+    if [[ -n "${mode-}" ]] && { [[ "$owner" != root ]] || ((8#$mode & 8#022)); }; then
+        warnings+=("$file is ignored by cron: it must be owned by root and not writable by others.")
+        return 0
+    fi
+    return 1
+}
+
+read_cron_sources() {
+    local file directory name
+
+    read_cron_file "$root/etc/crontab" /etc/crontab -
+    for file in "$root"/etc/cron.d/*; do
+        [[ -f "$file" ]] || continue
+        cron_d_is_ignored "$file" && continue
+        read_cron_file "$file" "cron.d/${file##*/}" -
+    done
+
+    if ((EUID == 0)); then
+        for directory in "$root/var/spool/cron/crontabs" "$root/var/spool/cron"; do
+            for file in "$directory"/*; do
+                [[ -f "$file" ]] || continue
+                read_cron_file "$file" crontab "${file##*/}"
+            done
+        done
+    elif command -v crontab >/dev/null; then
+        name=$(id -un)
+        while IFS= read -r file || [[ -n "$file" ]]; do
+            add_cron_line crontab "$name" "$file"
+        done < <(crontab -l 2>/dev/null)
+    fi
+}
+
+# Anacron runs the cron.* directories on machines that are not always on, plus any jobs of its own.
+read_anacrontab() {
+    local period command line
+
+    [[ -r "$root/etc/anacrontab" ]] || return 0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" =~ ^[[:space:]]*(#|$) ]] && continue
+        [[ "$line" =~ ^[[:space:]]*[A-Za-z_][A-Za-z0-9_]*[[:space:]]*= ]] && continue
+        read -r period _ _ command <<<"$line"
+        [[ -n "$command" ]] || continue
+        if [[ "$command" == *run-parts* && "$command" =~ /etc/cron\.(hourly|daily|weekly|monthly) ]]; then
+            expansions+=("${BASH_REMATCH[1]}|anacron|1|root")
+        else
+            case "$period" in
+                1) period=daily ;;
+                7) period=weekly ;;
+                @*) period=${period#@} ;;
+                *) period="every $period days" ;;
+            esac
+            add_row '' 'when due' "$period (anacron)" root anacron "$command"
+            cron_count=$((cron_count + 1))
+        fi
+    done <"$root/etc/anacrontab"
+}
+
+# List the scripts in each cron.* directory that a crontab or anacrontab line runs.
+expand_run_parts() {
+    local entry directory spec anacron user script name schedule
+
+    for entry in "${expansions[@]}"; do
+        IFS='|' read -r directory spec anacron user <<<"$entry"
+        [[ -z "${expanded[$directory]-}" ]] || continue
+        expanded[$directory]=1
+        if ((anacron)); then
+            next_text='' next_label='when due'
+            schedule="$directory (anacron)"
+        else
+            resolve_schedule "$spec"
+            schedule=$spec
+        fi
+        for script in "$root/etc/cron.$directory"/*; do
+            name=${script##*/}
+            [[ -f "$script" && -x "$script" && "$name" =~ ^[A-Za-z0-9_-]+$ ]] || continue
+            add_row "$next_text" "$next_label" "$schedule" "$user" "cron.$directory" "/etc/cron.$directory/$name"
+            cron_count=$((cron_count + 1))
+        done
+    done
+}
+
+# Turn a timer's systemd properties into the schedule it was set up with.
+timer_schedule() {
+    local text=$1 result='' key value
+
+    while [[ "$text" =~ (On[A-Za-z]+)=([^\;]+)\; ]]; do
+        key=${BASH_REMATCH[1]}
+        value=${BASH_REMATCH[2]}
+        value=${value%"${value##*[![:space:]]}"}
+        text=${text#*"${BASH_REMATCH[0]}"}
+        case "$key" in
+            OnCalendar) ;;
+            OnBootSec) value="boot +$value" ;;
+            OnStartupSec) value="startup +$value" ;;
+            OnActiveSec) value="timer +$value" ;;
+            OnUnitActiveSec) value="every $value" ;;
+            OnUnitInactiveSec) value="$value after it ends" ;;
+        esac
+        result+="${result:+, }$value"
+    done
+    printf '%s' "${result:--}"
+}
+
+read_timers() {
+    local line unit service id next index
+    local -a tokens=() units=() nexts=() services=() unique_services=()
+    local -A calendar=() monotonic=() state=() exec_start=() description=() service_user=() seen=()
+
+    command -v systemctl >/dev/null && [[ -d "$root/run/systemd/system" ]] || return 0
+
+    while IFS= read -r line; do
+        read -ra tokens <<<"$line"
+        ((${#tokens[@]} >= 2)) || continue
+        unit=${tokens[${#tokens[@]} - 2]}
+        service=${tokens[${#tokens[@]} - 1]}
+        next=''
+        if [[ "$line" =~ ^[A-Za-z]{3}[[:space:]]+([0-9]{4}-[0-9]{2}-[0-9]{2})[[:space:]]+([0-9]{2}:[0-9]{2}:[0-9]{2}) ]]; then
+            next="${BASH_REMATCH[1]} ${BASH_REMATCH[2]}"
+        fi
+        units+=("$unit") nexts+=("$next") services+=("$service")
+        if [[ "$service" != - && -z "${seen[$service]-}" ]]; then
+            seen[$service]=1
+            unique_services+=("$service")
+        fi
+    done < <(systemctl list-timers --all --no-legend --no-pager 2>/dev/null)
+    ((${#units[@]})) || return 0
+
+    while IFS= read -r line; do
+        case "$line" in
+            Id=*) id=${line#Id=} ;;
+            ActiveState=*) state[$id]=${line#ActiveState=} ;;
+            TimersCalendar=*) calendar[$id]=${line#TimersCalendar=} ;;
+            TimersMonotonic=*) monotonic[$id]=${line#TimersMonotonic=} ;;
+        esac
+    done < <(systemctl show -p Id -p ActiveState -p TimersCalendar -p TimersMonotonic "${units[@]}" 2>/dev/null)
+
+    if ((${#unique_services[@]})); then
+        while IFS= read -r line; do
+            case "$line" in
+                Id=*) id=${line#Id=} ;;
+                User=*) service_user[$id]=${line#User=} ;;
+                Description=*) description[$id]=${line#Description=} ;;
+                ExecStart=*)
+                    if [[ "$line" =~ argv\[\]=([^\;]*[^\;[:space:]]) ]]; then
+                        exec_start[$id]=${BASH_REMATCH[1]}
+                    fi
+                    ;;
+            esac
+        done < <(systemctl show -p Id -p User -p Description -p ExecStart "${unique_services[@]}" 2>/dev/null)
+    fi
+
+    for index in "${!units[@]}"; do
+        unit=${units[index]}
+        service=${services[index]}
+        next=${nexts[index]}
+        label='-'
+        [[ -z "$next" && "${state[$unit]-active}" != active ]] && label=inactive
+        add_row "$next" "$label" "$(timer_schedule "${calendar[$unit]-} ${monotonic[$unit]-}")" \
+            "${service_user[$service]:-root}" timer \
+            "${exec_start[$service]:-${description[$service]:-$service}}"
+        timer_count=$((timer_count + 1))
+    done
+}
+
+read_at_jobs() {
+    local line id day month date time year owner command
+
+    command -v atq >/dev/null || return 0
+    while IFS= read -r line; do
+        read -r id day month date time year _ owner <<<"$line"
+        [[ "$id" =~ ^[0-9]+$ && -n "${owner-}" ]] || continue
+        command=$(at -c "$id" 2>/dev/null | grep -v '^[[:space:]]*$' | tail -n 1)
+        add_row "$day $month $date $time $year" - once "$owner" at "${command:-at job $id}"
+        at_count=$((at_count + 1))
+    done < <(atq 2>/dev/null)
+}
+
+# Cron jobs that can never run are the quiet failure worth shouting about.
+check_cron_daemon() {
+    local unit running=0 found=0
+
+    ((cron_count > 0)) || return 0
+    if [[ ! -x "$root/usr/sbin/cron" && ! -x "$root/usr/sbin/crond" ]]; then
+        warnings+=("cron is not installed, so the cron jobs above never run.")
+        return 0
+    fi
+    command -v systemctl >/dev/null && [[ -d "$root/run/systemd/system" ]] || return 0
+    for unit in cron crond; do
+        systemctl cat "$unit.service" >/dev/null 2>&1 || continue
+        found=1
+        [[ "$(systemctl is-active "$unit.service" 2>/dev/null)" == active ]] && running=1
+    done
+    if ((found && !running)); then
+        warnings+=("The cron service is not running, so the cron jobs above never run.")
+    fi
+}
+
+# Shorten text to a width, ending in an ellipsis when it was cut.
+fit() {
+    local text=$1 width=$2
+
+    if ((${#text} > width)); then
+        printf '%s…' "${text:0:width-1}"
+    else
+        printf '%s' "$text"
+    fi
+}
+
+print_table() {
+    local epoch in next schedule owner source command line
+    local width_in=2 width_next=4 width_schedule=8 width_owner=4 width_source=6 width_command columns=0
+    local -a sorted=() fields=()
+
+    mapfile -t sorted < <(printf '%s\n' "${rows[@]}" | sort -t $'\t' -k1,1n -k2,2n)
+    for line in "${sorted[@]}"; do
+        IFS=$'\t' read -r epoch _ in next schedule owner source command <<<"$line"
+        ((${#in} > width_in)) && width_in=${#in}
+        ((${#next} > width_next)) && width_next=${#next}
+        ((${#schedule} > width_schedule)) && width_schedule=${#schedule}
+        ((${#owner} > width_owner)) && width_owner=${#owner}
+        ((${#source} > width_source)) && width_source=${#source}
+    done
+    ((width_schedule > 26)) && width_schedule=26
+    ((width_owner > 12)) && width_owner=12
+    ((width_source > 22)) && width_source=22
+
+    if [[ -t 1 ]]; then
+        columns=${COLUMNS:-$(tput cols 2>/dev/null)}
+        [[ "$columns" =~ ^[0-9]+$ ]] || columns=0
+    fi
+    width_command=0
+    if ((columns > 0)); then
+        width_command=$((columns - width_in - width_next - width_schedule - width_owner - width_source - 10))
+        # On a narrow terminal, give the command room by squeezing the schedule and source columns.
+        while ((width_command < 30 && (width_schedule > 12 || width_source > 10))); do
+            ((width_schedule > 12)) && width_schedule=$((width_schedule - 1)) width_command=$((width_command + 1))
+            ((width_source > 10)) && width_source=$((width_source - 1)) width_command=$((width_command + 1))
+        done
+        ((width_command < 20)) && width_command=20
+    fi
+
+    printf '%s%-*s  %-*s  %-*s  %-*s  %-*s  %s%s\n' "$bold" "$width_in" IN "$width_next" NEXT \
+        "$width_schedule" SCHEDULE "$width_owner" USER "$width_source" SOURCE COMMAND "$reset"
+    for line in "${sorted[@]}"; do
+        IFS=$'\t' read -r epoch _ in next schedule owner source command <<<"$line"
+        ((width_command > 0)) && command=$(fit "$command" "$width_command")
+        line=$(printf '%-*s  %-*s  %-*s  %-*s  %-*s  %s' "$width_in" "$in" "$width_next" "$next" \
+            "$width_schedule" "$(fit "$schedule" "$width_schedule")" "$width_owner" "$(fit "$owner" "$width_owner")" \
+            "$width_source" "$(fit "$source" "$width_source")" "$command")
+        if ((epoch == unknown)); then
+            printf '%s%s%s\n' "$dim" "$line" "$reset"
+        else
+            printf '%s\n' "$line"
+        fi
+    done
+}
+
+read_cron_sources
+read_anacrontab
+expand_run_parts
+read_timers
+read_at_jobs
+check_cron_daemon
+
+printf '%sServer time%s  %s\n\n' "$bold" "$reset" "$(date -d "@$now" '+%a %Y-%m-%d %H:%M %Z')"
+if ((${#rows[@]} == 0)); then
+    echo "Nothing is scheduled."
+else
+    print_table
+    printf '\n%d jobs: %d cron, %d systemd timers, %d at\n' "${#rows[@]}" "$cron_count" "$timer_count" "$at_count"
+fi
+if ((${#warnings[@]})); then
+    printf '\n'
+    for line in "${warnings[@]}"; do
+        printf '%s!%s %s\n' "$yellow" "$reset" "$line"
+    done
+fi
+if ((EUID != 0)); then
+    printf '\n%sRun "sudo schedule" to include the crontabs of other users.%s\n' "$dim" "$reset"
+fi

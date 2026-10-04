@@ -23,7 +23,7 @@ Access list:
 
   Before turning on ufw for the first time, allow SSH or you will lock yourself out: sudo ufw allow OpenSSH && sudo ufw enable
 
-  A ufw rule that opens the port to everyone, such as "ufw allow 27017", bypasses the access list. status and public warn when they find one. Only ufw is supported; servers using firewalld or hand-written nftables rules need --no-firewall and their own rules.
+  ufw rules for the MongoDB port that mongo-access did not add, such as one written by hand with "ufw allow from 192.168.50.0/24 to any port 27017", are never changed or removed. status, list, and public show them, because they let addresses outside the access list connect. A rule that opens the port to everyone, such as "ufw allow 27017", "ufw allow 27000:28000/tcp", or "ufw allow in on eth0 to any port 27017", bypasses the access list entirely, and status and public warn about it. Rules that name an application profile are not checked. Only ufw is supported; servers using firewalld or hand-written nftables rules need --no-firewall and their own rules.
 
 Status:
   mongo-access status shows the service state, the addresses mongod is really listening on (not just what the config says), the config value, authentication, the firewall, and the access list, followed by warnings: no authentication, an access list that is not enforced, or a config change that has not been applied by a restart.
